@@ -8,6 +8,8 @@
 #include <arpa/inet.h>
 #include <linux/wireless.h>
 
+#include <netpacket/packet.h>
+
 #include "osdep/byteorder.h"
 #include "osdep/common.h"
 #include "osdep/crctable_osdep.h"
@@ -255,6 +257,86 @@ int raw_read(void)
     return 0;
 }
 
+int raw_write(unsigned char *buf, int count)
+{
+    int ret = -1;
+    unsigned int rate = 0;
+	unsigned char tmpbuf[4096];
+
+	unsigned char u8aRadiotap[] = {
+		0x00,
+		0x00, // <-- radiotap version
+		0x0c,
+		0x00, // <- radiotap header length
+		0x04,
+		0x80,
+		0x00,
+		0x00, // <-- bitmap
+		0x00, // <-- rate
+		0x00, // <-- padding for natural alignment
+		0x18,
+		0x00, // <-- TX flags
+	};
+
+    rate = 2 * 500000;
+
+	u8aRadiotap[8] = rate;
+
+    memset(tmpbuf, 0, sizeof(tmpbuf));
+
+    memcpy(tmpbuf, u8aRadiotap, sizeof(u8aRadiotap));
+    memcpy(tmpbuf + sizeof(u8aRadiotap), buf, count);
+    count += sizeof(u8aRadiotap);
+
+    buf = tmpbuf;
+
+    AIR_LOG("len = %d", count);
+
+	ret = write(g_raw_sk_fd, buf, count);
+	if (ret < 0) {
+		if (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS
+			|| errno == ENOMEM) {
+			usleep(10000);
+			return 0;
+		}
+
+        AIR_ERR("errno = %d", errno);
+		perror("write failed");
+		return -1;
+	}
+
+    return 0;
+}
+
+int open_raw(const char *iface, int fd)
+{
+
+	struct ifreq ifr;
+	struct sockaddr_ll sll;
+
+	/* find the interface index */
+	memset(&ifr, 0, sizeof(ifr));
+	strncpy(ifr.ifr_name, iface, sizeof(ifr.ifr_name) - 1);
+
+	if (ioctl(fd, SIOCGIFINDEX, &ifr) < 0) {
+		AIR_ERR("Interface %s: \n", iface);
+		perror("ioctl(SIOCGIFINDEX) failed");
+		return -1;
+	}
+
+	memset(&sll, 0, sizeof(sll));
+	sll.sll_family = AF_PACKET;
+	sll.sll_ifindex = ifr.ifr_ifindex;
+    sll.sll_protocol = htons(ETH_P_ALL);
+	if (bind(fd, (struct sockaddr *) &sll, sizeof(sll)) < 0) {
+		AIR_ERR("Interface %s: \n", iface);
+		perror("bind(ETH_P_ALL) failed");
+		return -1;
+	}
+
+    return 0;
+}
+
 int create_sock(const char *iface)
 {
     int fd = -1;
@@ -302,6 +384,8 @@ int create_sock(const char *iface)
         AIR_LOG("iface[%s] is monitor mode!", iface);
     }
 
+    open_raw(iface, fd);
+
 
     //close(fd);
     //fd = -1;
@@ -333,13 +417,66 @@ int set_channel(const char *ifname, int channel)
     return 0;
 }
 
+#define RATES "\x01\x04\x02\x04\x0B\x16\x32\x08\x0C\x12\x18\x24\x30\x48\x60\x6C"
+#define PROBE_REQ                                                              \
+	"\x40\x00\x00\x00\xFF\xFF\xFF\xFF\xFF\xFF\xCC\xCC\xCC\xCC\xCC\xCC"         \
+	"\xFF\xFF\xFF\xFF\xFF\xFF\x00\x00"
+
+static int send_probe_request(void)
+{
+	int len;
+	unsigned char p[4096] = {0};
+	unsigned char r_smac[6] = {0xCC, 0xDD,0xEE, 0xFF, 0x11, 0x22};
+
+	memcpy(p, PROBE_REQ, 24);
+
+	len = 24;
+
+	p[24] = 0x00; // ESSID Tag Number
+	p[25] = 0x00; // ESSID Tag Length
+
+	len += 2;
+
+	memcpy(p + len, RATES, 16);
+
+	len += 16;
+
+    #if 0
+	r_smac[0] = 0x00;
+	r_smac[1] = rand() & 0xFF;
+	r_smac[2] = rand() & 0xFF;
+	r_smac[3] = rand() & 0xFF;
+	r_smac[4] = rand() & 0xFF;
+	r_smac[5] = rand() & 0xFF;
+    #endif
+
+	memcpy(p + 10, r_smac, 6);
+
+	if (raw_write(p, len) == -1)
+	{
+		switch (errno) {
+			case EAGAIN:
+			case ENOBUFS:
+				usleep(10000);
+				return 0; /* XXX not sure I like this... -sorbo */
+		}
+
+		return -1;
+	}
+
+	return 0;
+}
+
 int main(void)
 {
-    set_channel("wls35u1mon", 6);
+    set_channel("wls35u1mon", 11);
     
     g_raw_sk_fd = create_sock("wls35u1mon");
 
-    raw_read();
+    //raw_read();
+    //while (1) {
+        send_probe_request();
+    //}
 
     close(g_raw_sk_fd);
     g_raw_sk_fd = -1;
