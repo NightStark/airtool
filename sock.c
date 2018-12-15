@@ -14,6 +14,9 @@
 
 #include "radiotap/radiotap.h"
 #include "radiotap/radiotap_iter.h"
+
+#include "lib/iwlib.h"
+
 /* radiotap-parser defines types like u8 that
 		 * ieee80211_radiotap.h needs
 		 *
@@ -67,6 +70,11 @@ struct rx_info
 	uint32_t ri_rate;
 	uint32_t ri_antenna;
 } __packed;
+
+///////////////////////////////////////////////////////////////////////////////
+
+int g_raw_sk_fd = -1;
+
 
 ///////////////////////////////////////////////////////////////////////////////
 
@@ -225,6 +233,28 @@ int handle_w_data(unsigned char *data, int caplen, struct rx_info *ri)
     return n;
 }
 
+int raw_read(void)
+{
+    int len = 0;
+    unsigned char buf[4096];
+    int t_n =100;
+    struct rx_info ri;
+    struct ieee80211_frame *wh = NULL;
+    int radio_tab_size = 0;
+
+    while (t_n--) {
+        memset(buf, 0, sizeof(buf));
+        len = read(g_raw_sk_fd, buf, sizeof(buf));
+        //AIR_LOG("len = %d", len);
+        radio_tab_size = handle_w_data(buf, len, &ri);
+        printf("power = %d, channel = %d\n", ri.ri_power, ri.ri_channel);
+        wh = (struct ieee80211_frame *)((char *)buf + radio_tab_size);
+        printf("DST:"MAC_FMT"\n", MAC_PRINT(wh->i_addr1));
+    }
+
+    return 0;
+}
+
 int create_sock(const char *iface)
 {
     int fd = -1;
@@ -234,7 +264,6 @@ int create_sock(const char *iface)
         AIR_LOG("socket failed.");
         return -1;
     }
-
 
 	struct ifreq ifr;
 
@@ -270,37 +299,50 @@ int create_sock(const char *iface)
     if (wrq.u.mode != IW_MODE_MONITOR) {
         AIR_ERR("iface[%s] is not monitor mode!", iface);
     } else {
-        AIR_ERR("iface[%s] is monitor mode!", iface);
-    }
-
-    int len = 0;
-    unsigned char buf[4096];
-    int t_n =100;
-    struct rx_info ri;
-    struct ieee80211_frame *wh = NULL;
-    int radio_tab_size = 0;
-
-    while (t_n--) {
-        memset(buf, 0, sizeof(buf));
-        len = read(fd, buf, sizeof(buf));
-        //AIR_LOG("len = %d", len);
-        radio_tab_size = handle_w_data(buf, len, &ri);
-        printf("power = %d, channel = %d\n", ri.ri_power, ri.ri_channel);
-        wh = (struct ieee80211_frame *)((char *)buf + radio_tab_size);
-        printf("DST:"MAC_FMT"\n", MAC_PRINT(wh->i_addr1));
+        AIR_LOG("iface[%s] is monitor mode!", iface);
     }
 
 
-    close(fd);
-    fd = -1;
+    //close(fd);
+    //fd = -1;
+
+    return fd;
+}
+
+int set_channel(const char *ifname, int channel)
+{
+    int skfd = -1;
+    struct iwreq wrq;
+
+    if((skfd = iw_sockets_open()) < 0) {
+        AIR_ERR("iw sockets open failed.");
+        return -1;
+    }
+
+    wrq.u.freq.flags = IW_FREQ_FIXED;
+    iw_float2freq(channel, &(wrq.u.freq));
+
+    if(iw_set_ext(skfd, ifname, SIOCSIWFREQ, &wrq) < 0) {
+        return -1;
+    }
+
+
+    iw_sockets_close(skfd);
+    skfd = -1;
 
     return 0;
 }
 
 int main(void)
 {
+    set_channel("wls35u1mon", 6);
     
-    create_sock("wls35u1mon");
+    g_raw_sk_fd = create_sock("wls35u1mon");
+
+    raw_read();
+
+    close(g_raw_sk_fd);
+    g_raw_sk_fd = -1;
 
     return 0;
 }
