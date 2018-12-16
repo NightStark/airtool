@@ -105,4 +105,7 @@ IMPORT int ieee80211_radiotap_iterator_init(
 IMPORT int ieee80211_radiotap_iterator_next(
 	struct ieee80211_radiotap_iterator *iterator);
 
+struct radiotap_align_size *
+ieee80211_radiotap_get_align_size(int presence);
+
 #endif /* __RADIOTAP_ITER_H */

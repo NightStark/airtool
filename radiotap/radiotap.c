@@ -393,3 +393,13 @@ int ieee80211_radiotap_iterator_next(
 			return 0;
 	}
 }
+
+struct radiotap_align_size *
+ieee80211_radiotap_get_align_size(int presence)
+{
+    if (presence < 0 || presence > radiotap_ns.n_bits) {
+        return NULL;
+    }
+
+    return (struct radiotap_align_size *)&radiotap_ns.align_size[presence];
+}

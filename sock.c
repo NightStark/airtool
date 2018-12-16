@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <string.h>
+#include <stdarg.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/ioctl.h>
@@ -10,6 +11,7 @@
 
 #include <netpacket/packet.h>
 
+#include "osdep/le_struct.h"
 #include "osdep/byteorder.h"
 #include "osdep/common.h"
 #include "osdep/crctable_osdep.h"
@@ -75,7 +77,13 @@ struct rx_info
 
 ///////////////////////////////////////////////////////////////////////////////
 
-int g_raw_sk_fd = -1;
+struct air_wi
+{
+    int fd_in;
+    int fd_out;
+};
+
+struct air_wi g_air_wi = {0};
 
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -88,6 +96,26 @@ unsigned long calc_crc_osdep(unsigned char * buf, int len)
 		crc = crc_tbl_osdep[(crc ^ *buf) & 0xFF] ^ (crc >> 8);
 
 	return (~crc);
+}
+
+void __dump_data(unsigned char *ptr, int len, const char *info_fmt, ...)
+{
+    va_list ap;
+    int i;
+
+    printf("\n************************\n");
+    printf("dump [");
+    va_start(ap, info_fmt);
+    vprintf(info_fmt, ap);
+    va_end(ap);
+    printf("]\n");
+
+    for (i = 0; i < len; i++) {
+        if (!(i%16))
+            printf("\n %04x", i);
+        printf(" %02x", ptr[i]);
+    }
+    printf("\n************************\n");
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -246,7 +274,7 @@ int raw_read(void)
 
     while (t_n--) {
         memset(buf, 0, sizeof(buf));
-        len = read(g_raw_sk_fd, buf, sizeof(buf));
+        len = read(g_air_wi.fd_in, buf, sizeof(buf));
         //AIR_LOG("len = %d", len);
         radio_tab_size = handle_w_data(buf, len, &ri);
         printf("power = %d, channel = %d\n", ri.ri_power, ri.ri_channel);
@@ -262,37 +290,86 @@ int raw_write(unsigned char *buf, int count)
     int ret = -1;
     unsigned int rate = 0;
 	unsigned char tmpbuf[4096];
+    int radiotab_len = 0;
+    struct ieee80211_radiotap_header *r_hdr = NULL;
 
+    #if 0
+    //00 00 00 00  04 80 00 00  00 00 18 00  00 00
+    //00 00 00 00  04 80 00 00  00 00 18 00
 	unsigned char u8aRadiotap[] = {
 		0x00,
 		0x00, // <-- radiotap version
 		0x0c,
 		0x00, // <- radiotap header length
+
 		0x04,
 		0x80,
 		0x00,
 		0x00, // <-- bitmap
+
 		0x00, // <-- rate
 		0x00, // <-- padding for natural alignment
 		0x18,
 		0x00, // <-- TX flags
 	};
 
+    radiotab_len = sizeof(u8aRadiotap);
     rate = 2 * 500000;
-
 	u8aRadiotap[8] = rate;
+    memset(tmpbuf, 0, sizeof(tmpbuf));
+    memcpy(tmpbuf, u8aRadiotap, radiotab_len);
+
+    __dump_data((unsigned char *)tmpbuf, radiotab_len, "RadioTab");
+    #else
+
+    int pad = 0;
+    unsigned char *pos = NULL;
+    struct radiotap_align_size *as =NULL;
 
     memset(tmpbuf, 0, sizeof(tmpbuf));
 
-    memcpy(tmpbuf, u8aRadiotap, sizeof(u8aRadiotap));
-    memcpy(tmpbuf + sizeof(u8aRadiotap), buf, count);
-    count += sizeof(u8aRadiotap);
+    r_hdr = (struct ieee80211_radiotap_header *)tmpbuf;
+    r_hdr->it_present = 
+        cpu_to_le32((1 << IEEE80211_RADIOTAP_RATE) |
+                (1 << IEEE80211_RADIOTAP_TX_FLAGS));
 
+#define __PAD \
+    pad = 0; \
+    as = ieee80211_radiotap_get_align_size(IEEE80211_RADIOTAP_TX_FLAGS); \
+    if (as->align > 1) { \
+        if (radiotab_len % as->align != 0) { \
+            pad = as->align - (radiotab_len % as->align); \
+            pos += pad; \
+            radiotab_len += pad; \
+        } \
+    }
+
+    //rate = 2 * 500000 * 6;
+    rate = (2 * 54); //* 500 000
+    pos = (unsigned char *)(r_hdr + 1);
+    radiotab_len += sizeof(struct ieee80211_radiotap_header);
+    
+    *pos = rate;
+    pos += 1;
+    radiotab_len += 1;
+    
+    __PAD;
+    put_unaligned_le16(0x18, pos);
+    pos += as->size;
+    radiotab_len += as->size;
+    r_hdr->it_len = radiotab_len;
+
+    __dump_data((unsigned char *)r_hdr, radiotab_len, "RadioTab");
+    #endif
+
+   
+    count += radiotab_len;
+    memcpy(tmpbuf + radiotab_len, buf, count);
     buf = tmpbuf;
 
     AIR_LOG("len = %d", count);
 
-	ret = write(g_raw_sk_fd, buf, count);
+	ret = write(g_air_wi.fd_out, buf, count);
 	if (ret < 0) {
 		if (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS
 			|| errno == ENOMEM) {
@@ -384,8 +461,6 @@ int create_sock(const char *iface)
         AIR_LOG("iface[%s] is monitor mode!", iface);
     }
 
-    open_raw(iface, fd);
-
 
     //close(fd);
     //fd = -1;
@@ -469,17 +544,22 @@ static int send_probe_request(void)
 
 int main(void)
 {
-    set_channel("wls35u1mon", 11);
+    set_channel("wls35u1mon", 1);
     
-    g_raw_sk_fd = create_sock("wls35u1mon");
+    g_air_wi.fd_in = create_sock("wls35u1mon");
+    g_air_wi.fd_out = create_sock("wls35u1mon");
+    open_raw("wls35u1mon", g_air_wi.fd_out);
+
 
     //raw_read();
     //while (1) {
-        send_probe_request();
+       send_probe_request();
     //}
 
-    close(g_raw_sk_fd);
-    g_raw_sk_fd = -1;
+    close(g_air_wi.fd_in);
+    close(g_air_wi.fd_out);
+    g_air_wi.fd_in = -1;
+    g_air_wi.fd_out = -1;
 
     return 0;
 }
