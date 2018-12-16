@@ -1,8 +1,8 @@
 
 CC=gcc
 
-OBJ_CFLAGS=-Wall
-LDFLAGS=-lm
+OBJ_CFLAGS=-Wall -I ieee80211/include/
+LDFLAGS=-lm -lpthread
 
 SRCS = sock.c radiotap/radiotap.c osdep/common.c lib/iwlib.c
 OBJS = $(patsubst %c,%o,$(SRCS))

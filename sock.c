@@ -2,6 +2,7 @@
 #include <unistd.h>
 #include <string.h>
 #include <stdarg.h>
+#include <pthread.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/ioctl.h>
@@ -20,6 +21,16 @@
 #include "radiotap/radiotap_iter.h"
 
 #include "lib/iwlib.h"
+
+#include <asm/byteorder.h>
+#if defined(__LITTLE_ENDIAN)
+#define _BYTE_ORDER     _LITTLE_ENDIAN
+#elif defined(__BIG_ENDIAN)
+#define _BYTE_ORDER     _BIG_ENDIAN
+#else
+#error "Please fix asm/byteorder.h"
+#endif
+#include "ieee80211/include/ieee80211.h"
 
 /* radiotap-parser defines types like u8 that
 		 * ieee80211_radiotap.h needs
@@ -41,28 +52,14 @@
 
 ///////////////////////////////////////////////////////////////////////////////
 
+#ifndef offsetof
+#define offsetof(type, field)   ((size_t)(&((type *)0)->field))
+#endif
+
+
 #ifndef __packed
 #define __packed __attribute__((__packed__))
 #endif /* __packed */
-
-
-#define IEEE80211_ADDR_LEN 6
-
-struct ieee80211_frame {
-    u_int8_t    i_fc[2];
-    u_int8_t    i_dur[2];
-    union {
-        struct {
-            u_int8_t    i_addr1[IEEE80211_ADDR_LEN];
-            u_int8_t    i_addr2[IEEE80211_ADDR_LEN];
-            u_int8_t    i_addr3[IEEE80211_ADDR_LEN];
-        };
-        u_int8_t    i_addr_all[3 * IEEE80211_ADDR_LEN];
-    };
-    u_int8_t    i_seq[2];
-    /* possibly followed by addr4[IEEE80211_ADDR_LEN]; */
-    /* see below */
-} __packed;
 
 struct rx_info
 {
@@ -83,8 +80,9 @@ struct air_wi
     int fd_out;
 };
 
-struct air_wi g_air_wi = {0};
+static struct air_wi g_air_wi = {0};
 
+static unsigned char g_r_smac[6] = {0xCC, 0xDD,0xEE, 0xFF, 0x11, 0x22};
 
 ///////////////////////////////////////////////////////////////////////////////
 
@@ -263,6 +261,61 @@ int handle_w_data(unsigned char *data, int caplen, struct rx_info *ri)
     return n;
 }
 
+int ieee80211_parse_beacon(const struct ieee80211_frame *wh, int frame_length)
+{
+#define BEACON_INFO_ELEMENT_OFFSET    (offsetof(struct ieee80211_beacon_frame, info_elements))
+
+    unsigned int remaining_ie_length = 0;
+    struct ieee80211_beacon_frame  *beacon_frame = (struct ieee80211_beacon_frame *)&(wh[1]);
+    struct ieee80211_ie_header     *info_element = NULL;
+    int beacon_length = frame_length - sizeof(struct ieee80211_frame);
+
+    if (beacon_length < 0) {
+        AIR_ERR("beacon_length is invalid.");
+        return -1;
+    }
+
+    info_element = &(beacon_frame->info_elements);
+    remaining_ie_length = beacon_length - BEACON_INFO_ELEMENT_OFFSET;
+
+    /* Walk through to check nothing is malformed */
+    while (remaining_ie_length >= sizeof(struct ieee80211_ie_header)) {
+        /* At least one more header is present */
+        remaining_ie_length -= sizeof(struct ieee80211_ie_header);
+
+        if (info_element->length == 0) {
+            info_element += 1;    /* next IE */
+            continue;
+        }
+
+        if (remaining_ie_length < info_element->length) {
+            /* Incomplete/bad info element */
+            return -EINVAL;
+        }
+
+        //AIR_LOG("e id : %d", info_element->element_id);
+        char _ssid[32];
+        
+        /* New info_element needs also be added in ieee80211_scan_entry_update */
+        switch (info_element->element_id) {
+            case IEEE80211_ELEMID_SSID:
+                snprintf(_ssid, info_element->length + 1, "%s", (char *)(info_element + 1));
+                AIR_LOG("ssid = %s", _ssid);
+                break;
+        }
+
+        /* Consume info element */
+        remaining_ie_length -= info_element->length;
+
+        /* Go to next IE */
+        info_element = (struct ieee80211_ie_header *)
+            (((u_int8_t *) info_element) + sizeof(struct ieee80211_ie_header) + info_element->length);
+    }
+
+
+    return 0;
+}
+
 int raw_read(void)
 {
     int len = 0;
@@ -272,14 +325,30 @@ int raw_read(void)
     struct ieee80211_frame *wh = NULL;
     int radio_tab_size = 0;
 
-    while (t_n--) {
+    int type = -1, subtype, dir;
+
+    while (t_n) {
         memset(buf, 0, sizeof(buf));
         len = read(g_air_wi.fd_in, buf, sizeof(buf));
         //AIR_LOG("len = %d", len);
         radio_tab_size = handle_w_data(buf, len, &ri);
-        printf("power = %d, channel = %d\n", ri.ri_power, ri.ri_channel);
+        //printf("power = %d, channel = %d\n", ri.ri_power, ri.ri_channel);
         wh = (struct ieee80211_frame *)((char *)buf + radio_tab_size);
-        printf("DST:"MAC_FMT"\n", MAC_PRINT(wh->i_addr1));
+        //printf("DST:"MAC_FMT"\n", MAC_PRINT(wh->i_addr1));
+        type = wh->i_fc[0] & IEEE80211_FC0_TYPE_MASK;
+        subtype = wh->i_fc[0] & IEEE80211_FC0_SUBTYPE_MASK;
+        dir = wh->i_fc[1] & IEEE80211_FC1_DIR_MASK;
+
+        if (type == IEEE80211_FC0_TYPE_MGT) {
+            if (subtype == IEEE80211_FC0_SUBTYPE_PROBE_RESP) {
+                if (!memcmp(g_r_smac, wh->i_addr1, IEEE80211_ADDR_LEN)) {
+                    AIR_LOG("GOT PROBE_RESP");
+                    ieee80211_parse_beacon(wh, len);
+                }
+                t_n--;
+            }
+        }
+
     }
 
     return 0;
@@ -501,7 +570,7 @@ static int send_probe_request(void)
 {
 	int len;
 	unsigned char p[4096] = {0};
-	unsigned char r_smac[6] = {0xCC, 0xDD,0xEE, 0xFF, 0x11, 0x22};
+	//unsigned char r_smac[6] = {0xCC, 0xDD,0xEE, 0xFF, 0x11, 0x22};
 
 	memcpy(p, PROBE_REQ, 24);
 
@@ -525,7 +594,7 @@ static int send_probe_request(void)
 	r_smac[5] = rand() & 0xFF;
     #endif
 
-	memcpy(p + 10, r_smac, 6);
+	memcpy(p + 10, g_r_smac, 6);
 
 	if (raw_write(p, len) == -1)
 	{
@@ -542,6 +611,13 @@ static int send_probe_request(void)
 	return 0;
 }
 
+void *read_thread(void *arg)
+{
+    raw_read();
+
+    return NULL;
+}
+
 int main(void)
 {
     set_channel("wls35u1mon", 1);
@@ -551,10 +627,19 @@ int main(void)
     open_raw("wls35u1mon", g_air_wi.fd_out);
 
 
-    //raw_read();
-    //while (1) {
-       send_probe_request();
-    //}
+    pthread_t r_tid;
+	pthread_attr_t thrd_Attr;
+
+	pthread_attr_init(&thrd_Attr);
+	pthread_attr_setdetachstate(&thrd_Attr, PTHREAD_CREATE_DETACHED);
+    pthread_create(&r_tid, NULL, read_thread, NULL);
+
+    while (1) {
+        send_probe_request();
+        while (1) {
+            sleep(1);
+        }
+    }
 
     close(g_air_wi.fd_in);
     close(g_air_wi.fd_out);
